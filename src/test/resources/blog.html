@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <title>Marc de Palol</title>
+  <meta name="description" content="Marc's Web">
+  <link rel="shortcut icon" href="/favicon.png">
+  <link rel="stylesheet" href="../styles/me.css">
+</head>
+
+
+<body>
+<!-- HEADER -->
+<header>
+  <h1>Marc's Web / Blog</h1>
+  <nav>
+    / <a href="index.html">Main</a> / <a href="me.html">About me</a> / <a href="blog.html">Blog</a> / <a href="links.html">Links</a>
+  </nav>
+</header>
+
+<!-- MAIN BODY -->
+<main>
+
+  <p>I've been blogging since a long time, probably since 2005, using different platforms. Some have
+    already disappeared, which is a shame because I've lost tons of crap I wrote. Some of it was funny</p>
+
+  <p>I'm working on getting the content from the blogging platforms that still exist and migrating the posts
+    here, but the generated HTML is just horrible. I'm going to clean it before adding it here. It will
+    take time unfortunately. BTW, <a target="_blank" rel="noopener" href="https://pandoc.org/">Pandoc</a> is a great tool
+    to clean up messy HTML and it's helping a lot</p>
+
+  <p>Some of the posts have the [TIL] prefix. This is to indicate that these belong to the "Today I Learned" initiative, which is a great way
+    to try to share cool things that I learn while working and coding, hoping that they are useful to somebody!</p>
+
+  <hr>
+  <h2>Table of Contents</h2>
+  [08/11/2021] <a href="#blog_polling">Polling is hard</a> <br>
+  [10/06/2021] <a href="#blog_quit_sm">Quitting Social Medial</a> <br>
+  [03/02/2021] <a href="#blog_proper_web">Small web pages</a>  <br>
+  [13/01/2021] <a href="#blog_among_us">Playing Among Us live with the family</a>  <br>
+  [23/12/2020] <a href="#blog_til1">[TIL] Mocking statics in Kotlin</a> <br>
+  [22/04/2020] <a href="#blog_parallel">Parallel & Xargs</a>  <br>
+  [20/01/2020] <a href="#blog_gossip">Gossip protocols</a> <br>
+  [05/12/2013] <a href="#blog_hystrix">Hystrix</a>  <br>
+  <hr>
+  <div class="post">
+    <a id="#blog_polling"><h2>Polling is hard</h2> </a>
+    <b>Publication date: </b> <div class="date">08/11/2021</div><br>
+    <b>Originally pubished here</b><br>
+    <div class="post_content">
+      <p>I've been several years working in backend and data related jobs. There are some tasks that keep popping up again, one of them is "we need to 'listen' to that database and be notified when anything changes"</p>
+      <p>This problem has had different solutions depending on the year you had to solve it and the technologies your company is using.</p>
+      <p>Some years ago if you were using an open source database you probably had to do <b>polling</b> which is basically a technique that relies in querying continuously the database for changes. If you used a paid database you probably had an expensive addon that you could just activate to get the data out of the database. </p>
+      <p>Then the Lambda architecture appeared and people started talking about "streaming" architectures, that is, data flowing through "pipes", with processes reading from them and processes writing into them. These kind of patterns clashed with some of the ideas of databases in general. Meant to keep the data stored safely, they were mostly designed to keep the data in there, not to <b>keep it and stream it</b>. </p>
+      <p>Different database vendors saw a business oportunity (or need) and started to offer different ways to accomplish that, and in parallel there was a big investment in Change Data Capture systems (CDC from now on), such as Debezium, which do exactly this. Listen to a database, properly, and send its inserts/updates/deletes in real time to a streaming platform, such as Kafka. </p>
+      <p>Unfortunately this is not enough sometimes. There are still situations nowadays where you still need to roll up your sleeves and implement a polling mechanism to an ancient database, a weird CRM system or ... god knows what. </p>
+      <p>Let me tell you some of my experiences with polling, because it sounds simple, but it might get tricky</p>
+      <h3>Polling basics</h3>
+      <p>First things first. Here are few things you need to know from your data source before writing a single line of code. </p>
+      <p>Conceptually <b>polling</b> is the act accessing the datasource to fetch everything and keep doing that forever, resulting in a flow of data.</p>
+      <p>In these next sections we are going to dissect a polling technique and understand all the implications that need to be taken care of:</p>
+      <ol>
+        <li>How do we know that the data has been updated?</li>
+        <li>What happens when there is a deletion?</li>
+        <li>How are you going to read the data from the db <b>the first time</b> without bringing the thing down?</li>
+        <li>How is your poller going to survive reboots, connection issues, ...</li>
+        <li>Does your datasource have any peculiarity?</li>
+      </ol>
+      <h3>What checkpoint are you going to use?</h3>
+      Have a look at the tables you'll need to read, all of them will need to have a similar pattern. The idea is that you do:
+      <pre><code>
+1) select all data // initial load
+2) select all data that changed since [step 1] finished
+3) select all data that changed since [step 2] finished
+...
+n) select all data that changed since [step n-1] finished
+...
+</code></pre>
+
+      <p>The question to answer here is <i>how do I know what changed between [step n] and [step n+1]?</i>, and this will depend on the database engine and the table schema. </p>
+      <p>Luckily there are some common table design patterns that are helpful when dealing with this: </p>
+      <ol>
+        <li>Incremental ids:</li> This is usually a good solution. Lots of tables have sequential ids, which is great because it helps a lot with the inserts. What happens in the updates though ? What happens in the deletes though? This will depend on the kind of data you are storing in there. If you are storing deltas then it's fine because for each operation you will have a new id. Truth be told that this pattern is usually not done using relational databases, so probably you won't be so lucky. Potentially, you will find a typical materialised view of the table. So you definitely won't be able to use the ids.
+        <li>Last updated timestamp:</li> This is pretty much the best imho. You'll be using this in the select. Just remember to `ORDER BY` this field. Oh, and by the way, extremely important. Is this seconds, miliseconds, micros? Of course the more precise the better. If you're using big granularities, like seconds, you'll receive lots of rows with the same timestamp, and this might be a problem. More on this later.
+      </ol>
+
+      <h3>What about db triggers?</h3>
+      <p>Relational databases have triggers, well, respectable databases have triggers. Should we use them here? </p>
+      <p>The concept is simple, just create a trigger that for every change in the streamed table you get what changed and insert a "delta" in another table, which is what you are going to stream.</p>
+      <p>The format for this table should be special for streaming, for example: </p>
+
+      <pre><code>
+CREATE TABLE cdc_events (
+    event_id int NOT NULL AUTO_INCREMENT,   // So you'll be able to checkpoint this table easily
+    data string NOT NULL,                   // contents of the event
+    operation string NOT NULL,              // insert, update or delete ? 
+    updated_at timestamp NOT NULL           // timestamp when this event happened, also will make 
+                                            // it easy to checkpoint
+);
+</pre></code>
+
+      <p>After you have this table ready you only need do basic polling, streaming and deleting what you just polled. You definitely don't want this table to grow indefinitely. So: </p>
+      <ol>
+        <li>Run select</li>
+        <li>get the checkpoint (event_id)
+        <li>Stream
+        <li>Delete from the table until `event_id`
+      </ol>
+
+
+      <h3>Hard deletes? or soft deletes?</h3>
+      <p>This is, in fact, a very important point. You can delete data from a database in two different ways</p>
+      <ul>
+        <li>Hard deletes: This is when rows are really deleted, using a sql `DELETE FROM`, data just goes away.</li>
+        <li>Soft deletes (or logical deletes): This is when the rows are not phisically deleted from the db. Usually there is a column that indicates that the column is deleted, this technique is called `tombstones`. So, instead of deleting the row with a sql `DELETE` you just update the `tombstone` field to be set to true.</li>
+      </ul>
+
+      <p>The polling mechanism will need to take this into account. </p>
+      <p>If the table is using hard deletes you'll have a very bad time. Basically <em>it cannot be done without triggers</em>, not great.</p>
+
+      <p>When the table that you need to stream is using hard deletes you'll need to set up a trigger that captures the deletion and updates a temporal table, then your poller will need to check this table also and stream it. It's a cumbersome process and you might have out of order events in your stream, as you'll need to setup two different pollers (one for your main table, and one for the deletions table that's populated via triggers). </p>
+      <p>On the other hand, if the system you need to stream is using soft deletes (or logical deletes) you're lucky, you don't need to do anything special other than taking the `tombstone` column into account</p>
+
+
+      <h3>How are you going to perform the initial load?</h3>
+      <p>The initial load might be a problem or not depending on the size and use of the database</p>
+      <p>If you're lucky enough to have a small table, or a database that's not heavily used in production you can set your initial id to 0, your `last_updated` timestamp to 1970 or whatever solution works for your checkpoint strategy. In the end, you'll be doing a kind of sql `SELECT *` from the table contents.</p>
+      <p>Is this a problem? well, for a 1000 rows table that might not be a problem, but if you have some millions of rows in there and the database sees serious usage you definitely do not want to include lag</p>
+      <p>You'll need to think this carefully</p>
+      <p>There are databases that let you use "bulk" types of queries. These queries are specially designed to run big massive jobs on the background, and store the results somewhere else, where you can easily fetch them and stream them. </p>
+      <p>Of course, this comes with a catch, after you've streamed your initial load you'll have to start polling from the latest timestamp that came from the original bulk. So, take that into account, because you'll have to store this information somewhere.</p>
+
+      <h3>Resiliency</h3>
+      <p>What to do when your poller dies?</p>
+      <p>Because, you know. It will eventually die.</p>
+      <p>Let's think a moment of what this implies:</p>
+      <ul>
+        <li>Connect to the db you need to stream. </li>
+        <li>Run a long query (initial dump)</li>
+        <li>Process the results of the query: mapping data, filtering?, ...</li>
+        <li>Stream the results to the streaming engine (Kafka, Kinesis, ...) </li>
+      </ul>
+      <p>Any experienced developer will realise that ANY of these points can fail in multiple ways. So, the polling system that you implement will need to be able to react to those well known integration points.</p>
+      <p>From my experience it means that you need to checkpoint, checkpoint, checkpoint and checkpoint. And handle idempotency. And understand exactly what kind of transactional integrity you're dealing with.</p>
+      <p>Step by step. You'll realise that we can translate the previous points into different polling stages: First you need to run the `SELECT` query and get the results. Do you need to checkpoint? Not really. You need to checkpoint once the processed row gets into the streaming system (and you really need to make sure that the event is there, this is dicussion for another day). </p>
+      <p>Checkpointing is writing the point where you have succesfully <em>READ</em> one row from the db and <em>WRITTEN</em> it into the streaming system in a <em>durable storage</em>. Why do I emphasize the durable storage? It's because your polling system will restart eventually and you really want to make sure that when it goes up again it will be able to continue from the exact place where it left off. So, do not store the checkpoints in RAM, use an external system or use an appending log (but make sure that the storage is permanent, VM instances tend to wipe out the hard disk when they reboot)</p>
+      <p>Let's expand on this. Imagine that you are running your poller in a query like this: </p>
+
+      <pre><code>
+SELECT id, col1, col2, col3, last_updated
+FROM table1
+WHERE last_updated &lt; last_checkpointed_ts
+ORDER BY last_updated
+</code></pre>
+
+      <p>So, you fetch the Result iterator and for each row you read the data from the iterator, transform it and send it through the streaming service. Naturally each time you checkpoint (basically write the `last_updated` field in a db elsewhere). If the system goes down, with its "permanent" k8s storage and its RAM the system will be able to restart again, go to the external DB, recover the checkpointing state and continue at the exact place where it last checkpointes. Amazing, but wait, it's not exactly that easy. </p>
+
+      <p>Resiliency in polling systems goes hand in hand with the concept of idempotency. What will the system do on repeated polls over the same data? will you be able to detect it? does it really matter? From the poller point of view it's simpler be on the safe side and, in case of doubt, poll data that has already been polled and streamed. This sounds better than missing data behind. </p>
+      <p>This is fine as long as you document this feature. The clients that will read from the stream will need to know that they might receive the same event more than once. This might be tricky or extremely trivial. It depends 100% on the kind of data you're sending. If you're sending financial commands to be executed the clients might need to implement an indempotency check, if the data is just a temperature reading from a sensor you're probably good repeating some events from time to time. Unfortunately this is an extensive and complex topic, which is for another day</p>
+      <p>In order to have a more performant system you could try to checkpoint only when you have succesfully written a whole batch, but then if your system goes down in the middle of the batch it will restart its execution at the beginning, streaming repeated data into the stream. If the problem that brought the system down is permanent (bad mapping of data, wrong types, ...) your poller will be continuously restarting and sending the same records over and over through the stream.</p>
+      <p>So, do checkpoint often</p>
+
+      <h3>Understand how the data source works, and understand it well</h3>
+      <p>This point might seem a little bit off, but trust me, it's important.</p>
+      <p>Polling is basically running queries continuously and streaming them, so no big deal if you took into account all that I've written. But wait, there is more. All the database engines (or data sources) will behave differently in some corner cases, you need to know it, otherwise I can assure you that you'll have sleepless nights (looking at you, Salesforce)</p>
+      <p>Few points that you need to know if you want to create a real, resilient and trustable poller: </p>
+      <h4>What happens if somebody modifies a row while you're fetching the select results?</h4>
+
+      <p>This is very hard to test, but your system should be able to handle it. Let's imagine that you're reading a big chunk of data. The select you just ran returns 200 rows that have been modified during the last 1 hour.</p>
+      <p>So, you start the fetching phase of those rows from the db and while you're doing that, somebody modifies row number 157. What happens? well, it depends on your storage system, you need to test it, but there is a good possibility that you have the two following problems: </p>
+      <ol>
+        <li>Row 157 will have a more current timestamp field that row number 158, and 159, and ...: </li>
+        <p>Let's illustrate this with an example: </p>
+        <pre><code>
+  Results from query: 
+  ...
+  ['id-156', 'John Smith', '+004400812832', '01-03-2021T19:58:00']  // this is the `last_updated` field. 
+  ['id-157', 'John Doe', '+004400812658', '01-03-2021T19:58:01']    // This row was affected one second later
+  ['id-158', 'Jack Smith', '+004400812719', '01-03-2021T22:00:00']  // This is NOW, it was modified while 
+                                                                    //  I was fetching this.
+  ['id-159', 'Jack Doe', '+004400812729', '01-03-2021T19:58:02']    // Back at the "past"
+  ...
+  </pre></code>
+        <p>The problem with this is that you need to take that into account that if you are checkpointing at every read row you might have an issue here. It's a corner case yes, but it happens. </p>
+        <p>Let's suppose that you are actually doing this, checkpointing at every read operation. After reading result number 158 from the query your system will checkpoint at timestamp `...22:00:00`, which is what the system is supposed to do, but then your system goes down. When it starts again it will fetch the latest stored checkpoint and it will get this `...22:00:00`, so it will start getting data <em>after</em> that. Which means that you've missed row 159, and possibly many more. </p>
+        <p>One solution for this issue is maintaining the "previous checkpoint", if for any reason you realise that the previous checkpoint is in the future of the one you just read it means that this happened. So, you need to handle it.</p>
+      </ol>
+      <h4>If you're using a temporal field for checkpointing (`last_updated` for example), does it have enough granularity?</h4>
+      <p>This matters because this affects how you checkpoint. Imagine that a select results in these rows:</p>
+      <pre><code>
+  Results from query, notice that all of them have the same `last_updated` timestamp. 
+  ...
+  ['id-156', 'John Smith', '+004400812832', '01-03-2021T19:58:00']  
+  ['id-157', 'John Doe'  , '+004400812658', '01-03-2021T19:58:00']    
+  ['id-158', 'Jack Smith', '+004400812719', '01-03-2021T19:58:00']  
+  ['id-159', 'Jack Doe'  , '+004400812729', '01-03-2021T19:58:00']   
+  ...
+  </pre></code>
+      <p>This is probably a result of a batch job in the db, where different records have been created or updated at the same moment, because the timestamp is not granular enough. This is no problem per se and it happens a lot in reality. So far so good. </p>
+      <p>Now, let's run this query and fetch the results. We are checkpointing at every row, so you read the first result, and checkpoint to `01-03-2021T19:58:00`, fine. I fact, you'll be checkointing the same timestamp for every row. Fine. </p>
+      <p>The problem is when the system goes down at line 157 for example. System goes down, and when it boots again it will get the checkpoint, and start consuming after that right? Probably you've already seen now, that we are potentially skipping tons of records</p>
+      <p>What's the solution of this? the idea is to: </p>
+      <ol>
+        <li>Change the timestamp granularity to a more specific one, so this situation cannot happen.</li>
+        <li>Handle it in your code. How to do this? one thing that you can checkpoint <em>iff</em> the new checkpoint is bigger than the previous one. This will solve it, but in case of error you'll be re-reading the rows from the previous batch. You'll need to handle idempotency yourself.</li>
+      </ol>
+
+      <h3>TLDR</h3>
+      <p>Polling is hard</p>
+
+      <p>This is it. I hope that you had fun reading through this or helped you in any way if you need to implement one of these mean beasts. As always, if you have comments, doubts or requests feel free to drop me an e-mail! (you'll find it at the footer of this blog)</p>
+    </div>
+    <hr>
+  </div>
+  <a id="blog_quit_sm"><h2>Quitting Social Media</h2></a>
+  <b>Publication date: </b> 10/06/2021<br>
+  <b>Originally published in this blog</a></b><br>
+  <p>Some months ago I decided to do an experiment, I decided that I would quit all my social media accounts. I must
+    admit that I didn't know how it would end. Would I go back to Twitter in a rush to recreate my account? would I
+    just revive my Instagram? </p>
+  <p> Well, no. I haven't done anything like that. I haven't gone back to Social Media at all, and to tell you the truth
+    I couln't be happier</p>
+  <p>Looking back to the years I've spent using those systems I cannot stop asking myself if all of that was a waste of
+    time. Did I really win or obtain any kind of benefit reading other people's strong opinions, public playground fights,
+    or watching their lunches?</p>
+  <p>We could probably argue that I was following the wrong social media accounts. It's so difficult to have a proper
+    twitter timeline that it's probably not worth it.</p>
+  <p>During the years I was using Twitter (and I'm talking about Twitter because it is, by far, the SM channel I used the
+    most) I did several "stalinist purges" to make sure that I had a proper and positive timeline. No scammers, no famous
+    people, <b>no politicians</b>, but alas, there's always somebody that retweets something that ends up in my screen. No
+    matter how strong you filter stuff you'll always end up with right wing bullshit in there.</p>
+  <p>So what? what's the problem with it? Well, for me the problem is that I get nervous, I start scrolling and scrolling
+    and getting more nervous. </p>
+  <p>The last drop was watching <a target="_blank" rel="noopener" href="https://en.wikipedia.org/wiki/The_Social_Dilemma">The Social Dilemma</a>
+    by Netflix. Funnily enough <i>I already knew everything about this</i> as I've worked in social media companies and
+    adtech. But for some reason that "movie" annoyed me enough to commit to do the experiment.</p>
+  <p>What's the next step then? how do I keep informed and up-to-date with what's going on in the world? There are two
+    answers to this question:</p>
+  <ul>
+    <li>First one: <i>I don't</i>. This means that I don't keep up with the global news. I just don't care anymore.
+      And what's more important, I start to think that it really does not matter. If I need information about something
+      I can go and fetch it as needed, I don't need to be updateda about everything all the time. </li>
+    <li>Second one: <i>RSS</i>. I have my list of trusted sources. Only the stuff I really need and no bullshit. </li>
+  </ul>
+
+  <p>I am very happy to say say that I quitted SM and I never looked back</p>
+
+  <hr>
+  <a id="blog_proper_web"><h2>Small web pages</h2></a>
+  <b>Publication date: </b> 03/02/2021<br>
+  <b>Originally published in this blog</a></b><br>
+
+  <p>I'm happy to say that I've lately seen a good trend in the web, which is doing text-only based webs. It's just
+    not only about design, but also about accessibility and making sane web pages. </p>
+  <p>I must admit that this has also been one inspiration for me to start having a personal web again. I've had three or
+    four of them myself. Thing is that every time I moved from a pure HTML web page to something cooler I'd just leave it
+    there to rot. The motive? well, for me it was hard. I always ended up having problems with configurations, lots of
+    problems with formatting and designs. </p>
+  <p>I guess everybody has her own workflow for writing blogs and articles. What drove me nuts was having to use a web
+    browser to write. Right now I'm happily writing this with vim (or nvim, I really don't know) over a ssh connection. I'll
+    just commit these changes into the git repo and I'll merge to `master` once I'm happy with the article and then pull
+    the changes in the server. I understand all that is going on and I like it. </p>
+  <p>This is one of the motives why I switched back to writing HTML directly, but there is more, I hate web frontend
+    frameworks</p>
+  <p>I usually code backend systems. Most of the time these systems do not have frontend, sometimes they do though. </p>
+  <p>Last time I had to write a frontend for one of my applications was a gruesome experience, I used <a target="_blank"
+                                                                                                         rel="noopener" href="https://vuejs.org/">Vue.js</a>, because some good folks recommended it. Well, I'm not going to ramble
+    about the experience. I just didn't like it. Couldn't understand a single thing, too much magic underneath. Oh, also,
+    the "hello world" web page was heavy. I don't know exactly, but mate, it was a web page displaying `hello world` and it
+    had megabytes of JavaScript libraries dependencies. </p>
+  <p>Back to the topic, recently I've seen some people having interesting and very valid conversations about how JS web
+    frameworks have gone insanely over complicated, or how the WWW became full of trackers that monitor every click. <p>
+  <p>In one side there's the people saying that complex applications require complex frameworks that allow the devs
+    to come up with e-commerce sites and dynamic applications. On the other side are the people saying that the webdev
+    community has gone too far and that the pages are extremely heavy, which, BTW is a problem if you don't have a high speed
+    internet connection, that <b>not everybody has</b>.</p>
+  <p>While I can see that both positions have strong arguments I tend to align with the ones that are saying that web pages
+    nowadays are far too bloated. Although, I'm definitely not saying that anybody should code a complex web application
+    with pure HTML.</p>
+  <p>This is a small list of some posts I've been reading recently that talk about exactly this, have a look, they are
+    all very interesting: </p>
+
+  <ul>
+    <li> <a target="_blank" rel="noopener" href="https://unixsheikh.com/articles/come-full-circle-back-to-html.html">Come full circle - back to HTML</a>
+      by "Unix Sheikh", where he explains why he went from writing into pure HTML to a CMS and then back to HTML because for in the end, for this
+      kind of blogs, it's the simplest and fastest solution. I agree wholeheartedly.
+    <li> <a target="_blank" rel="noopener" href="https://shkspr.mobi/blog/2021/01/the-unreasonable-effectiveness-of-simple-html/">The unreasonable effectiveness of simple HTML</a> by Terence Eden. This is an extremely interesting and <b>important</b> blog post that everybody should read. It's about
+      usability in the web. We tend to think that everybody is "surfing" the web with retina displays and tons of ram, but this is pretty far from the
+      reality. There are lots of people that browse web pages with old devices with obsolete browsers, and they might depend economically on filling
+      some government forms on those devices. Definitely worth reading.
+    <li> <a target="_blank" rel="noopener" href="https://blog.steren.fr/2020/my-stack-will-outlive-yours/">My stack will outlive yours</a> by Steren. More
+      info about usability and in this concrete case, how WordPress is doing horrible HTML.
+    <li> <a target="_blank" rel="noopener" href="https://1mb.club/">1Mb Club</a>. This is a nice list of web pages that weight less than 1mb.
+  </ul>
+
+  <hr>
+  <a id="#blog_among_us"><h2>Playing Among Us live with the family</h2> </a>
+  <b>Publication date: </b> 13/01/2021<br>
+  <b>Originally pubished here</b><br>
+  <p>My kids love <a target="_blank" rel="noopener" href="https://innersloth.com/gameAmongUs.php">Among Us</a>,
+    probably everybody loves Among Us, it is a really cool game. Haven't had time to play much unfortunately :-/</p>
+  <p>I don't know where the idea came from, but one day the kids asked us if we could play alltogether, we agreed
+    and then somebody said that we could play "live" at home. Me and my wife thought that it would be a great idea so,
+    much better and probably something more special than playing on different devices, so we planned it</p>
+  <p>Conceptually the game is pretty simple. There are some tasks that need to be done by a group of players, problem is
+    that there is an impostor there sabotaging the tasks and trying to kill the other players. When a player is suspicious
+    of somebody being the impostor there is a collective vote. The most voted player gets "killed". </p>
+  <p>It's pretty easy to "port" this game to the real life, you just need some tasks that can be done by everybody (kids
+    &amp; adults) and a proper place where everybody is able to do the tasks, hide and run around</p>
+  <p>We live in a 2 story house, so we have plenty of rooms to play. So all we had to do was find proper tasks for the
+    kids, we managed to come up with: </p>
+  <ul>
+    <li>Do a puzzle, a small one of course</li>
+    <li>Do some sums and substractions (kids are 7 &amp; 8, the youngest is three and he really doesn't care much about
+      tasks)</li>
+    <li>Do some calligraphy (nobody did this task)</li>
+    <li>Put some books in a shelf by alphabetic order</li>
+    <li>Build a 3 story building with Kapla</li>
+    <li>Find 3 hidden books in a room</li>
+    <li>Fold a t-shirt (this task was very... avoided)</li>
+    <li>...</li>
+  </ul>
+  <p>In the game the players run around the ship using different rooms and corridors, our house is different, so we thought
+    that it would be very obvious to know who is in each room doing each task, and it would be very "easy" to track the
+    impostor, so we decided that every task would have some "movement" as well. In each room there was the paper describing
+    the task and some extra instructions: "<i>Put all the books in the shelf. After you've put 5 books run to the living
+      room and come back to finish your task</i>". With this you get people running around the house, so it's a little bit more
+    challenging. </p>
+  <p>We wrote down the tasks and placed them in each room. Then we got together in the living room where the game started.
+    We put some papers in a cup with the different roles: 3 crewmate papers and 1 impostor. The youngest kid was happy
+    just running around after us, so he didn't need a role technically. </p>
+  <p>I was surprised about how fast and chaotic and <b>loud</b> the games were. I must admit that I hadn't watched my
+    kids play the original game much, but I'd never thought that the game intensity would be so, well, intense.</p>
+  <p>My kids screamed half laughing half panicking every time somebody got into the same room as them, everybody was
+    screaming, laughing and running around the house. The cat thought that we went nuts probably</p>
+  <p>The thing that surprised me the most is that it was just impossible to finish a single task, we had a "vote for the
+    impostor" every 30 seconds. Anything triggered a votation:</p>
+  <ul>
+    <li><i>Mommy looked me weird</i></li>
+    <li><i>You got into the same room as me!</i></li>
+    <li><i>I saw you sabotaging a task! (I was technically trying to do the goddamn puzzle!)</i></li>
+    <li><i>I'm not the impostor! so it must be you! (WTF!)</i></li>
+  </ul>
+  <p>A the end we managed to play 6 or 7 games. It was a big fun, nobody got hurt and nobody managed to finish a single
+    task</p>
+
+  <hr>
+  <a id="blog_til1"><h2>Mocking statics in Kotlin and other stuff</h2></a>
+  <b>Publication date: </b> 23/12/2020<br>
+
+  <p>I always try to test my code. It's definitely not my favorite thing, but I know that I must do it. It's the proper
+    way to do things. </p>
+
+  <p>Issue is that some parts of the code are pretty hard to test. These days I code mainly using Kotlin. Usually everything
+    is pretty straightforward, but every now and then you need to import a Java package. Usually problems do start
+    here. </p>
+
+  <h3>Static stuff</h3>
+  <p>Let's have a look at this case that I found recently: I have a class that writes some records into a PostgreSQL database.
+    It needs to connect to the db, execute the query and do some error checking.</p>
+
+  <p>The proper way to test this would be to mock the connection and make sure that the query I'm sending to the server is the
+    one I'm expecting to send (query is generated on-the-fly with some business logic) and that the error handling is done
+    properly.</p>
+
+  <p>First issue, the connection is handled by <a target="_blank" rel="noopener"  href="https://github.com/brettwooldridge/HikariCP">Hikari
+  </a>, which is a static class using static methods. Fuck.</p>
+
+  <p>And now the voices start telling you that this code is not that difficult, that mocking this is going to be bad, boring
+    difficult and that the gain is going to be minimal. The code is simple and anybody can see that there are no bugs. Yeah fine. </p>
+
+  <p>Some months later, after a long and painful debugging session you fix the bug in this code and you swear to god that a
+    static class won't serve as an excuse to not test again.</p>
+
+  <p>So, here we are. </p>
+
+  <p>After some research I found out that this is, in fact, a pretty common case and it has a very nice and proper solution.
+    In this example I'll be using Hikari and <a target="_blank" rel="noopener" href="https://github.com/seratch/kotliquery">Kotliquery</a> as examples.</p>
+
+  <p>Let's start with some db code. This is the code to connect: </p>
+
+  <pre><code>logger.info("Trying to connect to Postgres")
+HikariCP.default(
+    "jdbc:postgresql://host:port/database",
+    user,
+    password
+)
+connected = true
+logger.info("Connected to Postgres")
+</code></pre>
+
+  <p>Let's say that I want to make sure that the <code>user</code> and <code>password</code> variable are right. You usually
+    do this by mocking the <code>Hikari</code> <i>variable</i>. But in this code <code>Hikari</code> is not a variable. It's
+    a Java static class. </p>
+
+  <p>Luckily mockk provides this functionality: </p>
+
+  <pre><code>mockkObject(HikariCP)
+</code></pre>
+
+  <p>After doing this HikariCP is a "static mock", which is what we need. Then it's just a matter of doing: </p>
+
+  <pre><code>verify {
+    HikariCP.default(
+        "jdbc:postgresql://host:port/database",
+        "my_user",
+        "my_password"
+}
+</code></pre>
+
+  <p>So, continuing with the example. I'm using Kotliquery to build the queries that are going to be executed in the db. </p>
+
+  <p>This library has methods like this one, <a target="_blank" rel="noopener" href="https://github.com/seratch/kotliquery#creating-db-session">
+    sessionOf</a> that creates a database session using a datasource. This is a static method, it does not get
+    invoked on an object, so how to mock it?</p>
+
+  <p>This is the code to test it: </p>
+
+  <pre><code>mockkStatic("kotliquery.PackageKt")  // mock the file that declares
+                                     // the function. You need to 
+                                     // find it though.
+every { sessionOf(any()) } returns session  // now you can use it 
+                                            // as a mock :)
+</code></pre>
+
+  <h3>Chain of calls</h3>
+
+  <p>Another thing that I hate when mocking, because I'm lazy is having to mock a deep nested chain of calls:</p>
+
+  <pre><code>val name = object1.object2.object3.getName()
+</code></pre>
+
+  <p>I know that this is a code smell and that you should never have to reach this point. But, sometimes it happens. I used
+    to solve this like: </p>
+
+  <pre><code>val mockObject1 = mockk<Object1>()
+val mockObject2 = mockk<Object2>()
+val mockObject3 = mockk<Object3>()
+
+every { mockObject1.object2 } returns mockObject2
+every { mockObject2.object3 } returns mockObject3
+every { mockObject3.getName()} returns "the f**** name"
+</code></pre>
+
+  <p>No more, I learned that if you declare a mockk as <code>relaxed</code> it works like a charm. <a target="_blank"
+                                                                                                      rel="noopener" href="https://mockk.io/#relaxed-mock">Official docs in here</a></p>
+
+  <pre><code>mockObject1 = mockk<Object1>(relaxed = True)
+</code></pre>
+
+  <p>Then you just can do this: </p>
+
+  <pre><code>every { mockObject1.object2.object3.getName() } returns "the f**** name"
+</code></pre>
+
+  <hr>
+  <a id="blog_parallel"><h2>Parallel & Xargs</h2></a>
+  <b>Publication date: </b> 22/04/2020<br>
+  <b>Originally pubished in Netlify</b><br>
+
+  <p>Nowadays we have amazing computers. I’m currently writing this blog post in a Dell XPS 15, this computer has12
+    cores. It makes sense to use them right?</p>
+  <p>This is pretty easy to do when you writing software. All the (decent) programming languages the devs with all kind
+    of tools to make good use of the computing resources.</p>
+  <p>But, what if you need that in the command line? well, there are two well known solutions: <code>xargs</code>
+    and <code>parallel</code></p>
+  <p>I’ve always had problems with these two amazing tools, I know that they basically overlap quite a lot, so I
+    decided that I would dig a little bit deeper to see their differences and what it’s better to use one or another.</p>
+  <p>I have lots of problems remembering things, so I figured out that ease of use is a very important. So, for me,
+    if there are no big differences in performance, the easiest to remember wins.</p>
+  <p>So, first of all, let’s present the scenario: I created 25 2.8 Gb random text files (last section in the post
+    for explanation). The idea is to compress them to see if there is any difference in timings, but most importantly for me
+    , see how the two different command lines look like. But for the sake of simplicity, let’s think that I have 25
+    text files named <code>encoded_$.txt</code> where <code>$</code> is a number from 1 to 25.</p>
+  <h3 id="gzipping-all-the-things-how-it-works.">Gzipping all the things! how it works.</h3>
+  <p>To build the command lines it’s important to understand the <code>gzip</code> command in Linux.
+    This command takes a list of files as input and compresses (or decompresses them) one by one. This is extremely
+    important to know to build the commands.</p>
+  <p>So, if we run this:</p>
+  <pre><code>gzip -9 encoded_1.txt encoded_2.txt</code></pre>
+  <p>The system will compress the first file, and after it’s done it will compress the second one. This is not what
+    we want, this will only use one processor, the rest will just watch.</p>
+  <p>So, as I told before I’m evaluating two different tools. Let’s first use <code>xargs</code>.</p>
+  <h3 id="xargs-for-zipping">Xargs for zipping</h3>
+  <p>So, <code>xargs</code> by definition reads items from the standard input and executes a specific command with those
+    items as parameters.</p>
+  <p>So, if we run this:</p>
+  <pre><code>ls | xargs gzip -9</code></pre>
+  <p><code>ls</code> lists all the files and gives them to <code>xargs</code> through the <code>|</code>,
+    then <code>xargs</code> gives them to <code>gzip</code>; resulting in one CPU compressing at 100%. Wtf.</p>
+  <p>Well, that’s why it’s extremely important to understand how the <code>gzip</code> (or any other command)
+    works when using <code>xargs</code>.</p>
+  <p>What’s happenning here is that <code>xargs</code> ends executing this:</p>
+  <p><code>gzip -9 encoded_1.txt encoded_2.txt ...</code></p>
+  <p>Not good at all, this is now what we wanted. But fear not, you only need to read the massive <code>xargs</code> man page and find this:</p>
+  <pre><code>-n max-args, --max-args=max-args
+  Use at most max-args arguments per command line.  Fewer than max-args 
+  arguments will be used  if  the  size (see the -s option) is exceeded,
+  unless the -x option is given, in which case xargs will exit.</code></pre>
+
+  <p>So if <code>xargs</code> receives more than <code>-n</code> parameters it will “fork” the command. This is exactly what we want. So, let’s try again:</p>
+  <pre><code>ls | xargs -n 1 gzip -9</code></pre>
+  <p>Still, one CPU at 100%, the rest idle. Wtf. No worries, let’s keep reading the man page. 20 minutes later…</p>
+  <pre><code>-P max-procs, --max-procs=max-procs
+  Run  up to max-procs processes at a time; the default is 1.  If 
+  max-procs is 0, xargs will run as many processes as possible at
+  a time.  Use the -n option or the -L option with -P; otherwise 
+  chances are that  only one  exec  will be done.  While xargs is 
+  running, you can send its process a SIGUSR1 signal to increase 
+  the number of commands to run simultaneously, or a SIGUSR2 to 
+  decrease the  number.   You  cannot  increase  it above an 
+  implementation-defined limit (which is shown with --show-limits).
+  You cannot decrease it below 1.  xargs never terminates its 
+  commands; when asked to decrease, it merely waits for  more 
+  than one existing command to terminate before starting another.</code></pre>
+  <p>Ok, that’s the number of processes that xargs will run at a given time. By default 1, bad. Ok, let’s change that to my number of CPU’s:</p>
+  <pre><code>ls | xargs -P 12 -n 1 gzip -9</code></pre>
+  <p>which gets the task done in:</p>
+  <pre><code>real    9m37.042s
+user    84m31.327s
+sys     1m42.311s</code></pre>
+  <p>let’s uncompress the stuff now:</p>
+  <pre><code>ls *.gz | xargs -P 12 -n1 gzip -d</code></pre>
+  <p>which is pretty neat:</p>
+  <pre><code>real    2m49.367s
+user    13m57.625s
+sys     1m34.855s</code></pre>
+  <h3 id="parallel-the-zipping">Parallel the zipping</h3>
+  <p>Let’s have a look at the command:</p>
+  <pre><code>parallel --progress gzip -9 ::: *</code></pre>
+  <p>By default it uses all the cores (yay!), so no need to mangle with params <strong>for this specific and very simple case</strong>, let’s have a look at the performance:</p>
+  <pre><code>real    11m15.732s
+user    95m15.038s
+sys     2m15.463s</code></pre>
+  <p>which is roughly the same as the <code>xargs</code> example.</p>
+  <p>Let’s repeat the unzipping:</p>
+  <pre><code>parallel gzip -d ::: *.gz</code></pre>
+  <p>result:</p>
+  <pre><code>real    2m46.476s
+user    14m35.676s
+sys     1m36.861s</code></pre>
+  <p>Again, more or less the same. So, we can see that there are no <strong>big</strong> differences.</p>
+  <h3 id="so-my-conclusions">So, my conclusions</h3>
+  <p>For this extremely simple use case, which is often found in a normal day-to-day administration task, or even in some home usage of Unix systems I think parallel is easier to remember and to use.</p>
+  <p>That said.</p>
+  <p>Both are very complex tools that have an overlap, but one does not replace the other.</p>
+  <p><code>parallel</code> is a tool that its purpose is parallellizing tasks, it offers you tons of features to do so, it also allows you to run tasks in other machines, assign slots, retries, …</p>
+  <p><code>xargs</code> is used to build command lines given some parameters. It also has the feature to parallelize stuff, but it’s not its main aim.</p>
+  <p>Both have extensive manuals (<a href="http://www.youtube.com/playlist?list=PL284C9FF2488BC6D1">even youtube tutorials</a>), and are great tools. Use them right!</p>
+  <h3 id="extra-how-i-created-the-files.">Extra: How I created the files.</h3>
+  <pre><code>seq 25 | xargs -P 12 -n 1 -I% sh -c &#39;{ dd if=/dev/urandom of= \
+  sample_&quot;%&quot;.bin bs=64M count=64 ; uuencode sample_&quot;%&quot;.bin \
+  sample_&quot;%&quot;.bin &gt; encoded_&quot;%&quot;.txt; rm sample_&quot;%&quot;.bin; }&#39;</code></pre>
+
+
+
+  <hr>
+  <a id="blog_gossip"><h2>Gossip Protocols</h2></a>
+  <b>Publication date: </b> 20/01/2020<br>
+  <b>Originally pubished in Netlify</a></b><br>
+  <p>For some reason, I’m a big fan of <a href="https://en.wikipedia.org/wiki/Gossip_protocol">gossip protocols</a>. I really don’t know why but I think that the idea is great. I guess it still surprises me that they work at all.</p>
+  <p>Basically a Gossip Protocol (or Epidemic protocol) is a way of communicating messages and kind of spreading information in distributed systems. It basically mimics how rumors or diseases are spread in societies.</p>
+  <p>My experience with them was rather simple though, I played with the concept doing some extremely easy half implementations in my desktop machine during my Universitiy years, but never went much farther.</p>
+  <p>Recently I had to teach in a “Introduction to distributed systems” class, and I was looking for exercises, so the attendants could get dirty on some DistSys related implementation, and well, I thought that the implementation of a simple gossip protocol could be both a great learning experience and fun as well, and also, we are living in the future and we have <code>docker</code>!</p>
+  <p>So, of course I created <a href="https://github.com/lant/gossip">my own implementation</a> to see how hard it would be.</p>
+  <h3 id="how-a-gossip-protocol-works">How a gossip protocol works</h3>
+  <p>I started without doing much research, just with the knowledge I kept from that University class from 15 years ago. I did that on purpose to see exactly what kind of problems I would find. This was a playground from the start so I wanted to face the same doubts and challenges that the students in the course would have.</p>
+  <p>Gossip protocols can be designed in lots of different ways. First questions that popped up into my mind:</p>
+  <ul>
+    <li>Are the nodes spreading information when they receive it or periodically ?</li>
+    <li>Are the nodes publishing the information when they receive it? or are the nodes asking for information to the other nodes?</li>
+    <li>Is there any way to know that all the nodes have reached a consensus?</li>
+    <li>How does a node know that the information its receiving is current, and not some old rumor that keeps on spreading?</li>
+    <li>And a very very important one, how does a node in these kind of clusters knows their peers ?</li>
+  </ul>
+  <p>So, after I had this list of questions I did the sane thing to do, which was look for bibliography and resources about gossip protocols and I validated that all my doubts were valid ones, all of them being hot topics in gossip protocols research.</p>
+  <p>One of the key questions was the first one, how to spread the information. There are two classifications of gossips, <em>anti entropy</em> protocols and <em>rumor mongering</em> protocols.</p>
+  <h4 id="classification-by-dissemination-strategy">Classification by dissemination strategy</h4>
+  <p>What’s the difference between them? It’s basically their termination and their node states.</p>
+  <p>The <em>anti entropy</em> strategies are simpler. They are also called <em>Simple Epidemics</em> and they are designed to run forever. On the other hand the <em>rumor mongering</em> strategies, or <em>Complex Epidemics</em> are designed to run until the change has been propagated to all the nodes.</p>
+  <p>Both strategies we have the following node states:
+  <ul>
+    <li><strong>Susceptible</strong>: A node has not received the information yet.
+    <li><strong>Infected</strong>: A node has received the information.</p>
+  </ul>
+  <p>And <em>rumor mongering</em> strategies add a third state:
+  <ul>
+    <li><strong>Removed</strong>: When a node has been infected and it’s not actively propagating more information.</p>
+  </ul>
+  <h5 id="anti-entropy">Anti-entropy</h5>
+  <p>As stated before, this strategy keeps propagating the data indefinitely, this is a good choice for a system that will see lots of updates.</p>
+  <p>Let’s remember that the nodes have just two states (not infected yet / infected). Propagation can work in different ways:</p>
+  <ul>
+    <li><strong>Push based</strong>: Nodes push their state to the rest of the nodes. They can do that immediately when they receive a new state, or they can just do it periodically.</li>
+    <li><strong>Pull based</strong>: Nodes ask other peers for the latest state.</li>
+    <li><strong>Hybrid</strong>: A mix of both would be to have a pull strategy where nodes ask for the latest state to their peers, and once they have it they propagate it actively to some peers.</li>
+  </ul>
+  <p>A common part of all of these strategies is that nodes are always (periodically) pushing starte or pulling state.</p>
+  <h5 id="rumor-mongering">Rumor mongering</h5>
+  <p>The inclusion of the third state in these strategies basically means that the propagation of the information stops when all the nodes in the cluster get to this third state.</p>
+  <p>There is quite a lot of work that demonstrates that this works fine, have a look at <a href="https://onlinelibrary.wiley.com/doi/abs/10.1002/047134608X.W8353">this article by Alberto Montsersor for example</a> if you’re interested.</p>
+  <h3 id="how-my-implementation-works">How my implementation works</h3>
+  <p><a href="https://github.com/lant/gossip/" title="Remember, we don&#39;t trust clock times in distributed systems">At the time of writing this post</a> the implementation of the gossip protocol works like this:</p>
+  <p><strong>Gossip strategy</strong>: The implementation follows an <em>anti-entropy</em> design with a push based model. This basically means that each node that have received a message will propagate it <strong>immediately</strong> and <strong>periodically</strong>.</p>
+  <p><strong>Timestamped messages</strong>: I decided that the most convenient thing to do was to bring the system up with a command and then be able to send messages with another command. This basically means that the data input is done manually. Given this situation and that all the nodes are running in a <code>docker-compose</code> environment having timestamps in the messages is good enough. Every time the user sends a message to be propagated into the cluster using any of the nodes, this node that receives the message from the user adds a timestmap, then it propagates this tuple. The rest of the nodes in the cluster decide which value is newer (the one they had or the new that they are receiving) based on this and acts accordingly.</p>
+  <p>While this approach is terribly convenient it might not work in a real scenario. Clocks might be skewed, so the comparisions between the messages could be totally wrong. Not only this, if the data to be propagated into the cluster came from another system (much faster than normal human user interaction) it would be prone to racing conditions.</p>
+  <p>I’m probably going to explore different approaches to get rid of the timestamp, like Lamport clocks for example. Even if I want this project to be a playground I want it to be as close as possible to a real system.</p>
+  <h3 id="unexpected-side-problems">Unexpected side problems</h3>
+  <p>I found some difficulties during the development of the system. Not related to coding exactly, something more “lack of better options” or “lacking of tooling”. Here they are:</p>
+  <h4 id="visualization-of-the-system">Visualization of the system</h4>
+  <p>I wanted to visualize how the system was sending messages from one node to the other. Basically a kind of UI that would let me have a look at what was going on in a distributed system.</p>
+  <p>I know that tracing in distsys is a complex topic. My first idea was using <code>jaeger</code> or <code>zipkin</code> to visualize the traces, but that’s not trivial, and after some researching I realized that this is definitely not what I wanted. It was a lot of effort to not achieve what I was looking for.</p>
+  <p>Of course another solution was doing something custom. But this is not something small, and most likely a project of its own. My ideal UI would represent the nodes in a canvas and it would be able to reproduce their state, the messages they send to each other and their content.</p>
+  <p>There are lots of different problems in here:</p>
+  <ul>
+    <li>The UI needs to store the events and replay them step by step.</li>
+    <li>Time in distributed systems is an impressively complex and chaotic topic. Can we rely on the timestamps to order the events? Nope. So, how can we visualize them in order if we cannot trust the timestamps? For this toy system we could of course, it’s not critical, and probably not a problem if they get somewhat disorganized.</li>
+    <li>Who keeps the history? this could be done if instead of a RPC solution the gossip protocol was using a message broker. But then, if we have a message broker, do we really need a gossip protocol?</li>
+  </ul>
+  <p>So, conclusion, the project does not have a UI. If you want to see what’s going on you have to rely on logs and not having too many <code>docker</code> instances running :-/</p>
+  <p>This issue can be an interesting project on its own as I said.</p>
+  <p>Few things to consider:</p>
+  <ul>
+    <li>I know that I could get <code>zipkin</code> / <code>jaeger</code> to work. But I still think this is too cumbersome, and the result is still not what I want.</li>
+    <li>Service mesh tooling would also help quite a lot, but I still think I’m adding too much complexity into this.</li>
+    <li>Parsing the logs and visualizing them is also an interesting approach that could be taken into account. The logs are structured, so they are easy to parse.</li>
+    <li>Had this been a true simulation system in a single computer would have helped a lot. It would just be a matter of storing all the events in a DB and then visualize the results.</li>
+  </ul>
+  <p>Which in fact, is probably the best solution for this specific case. Given that this is a playground and I don’t need to get extremely dogmatic probably a feasible solution would be to send all the “events” into another system that just unifies everything. To make sure that the events do not get unsorted I could introduce a constent delay. Basically, slow down the system so that racing conditions are not a problem. It’s ugly but definitely would help with the visualization of the system for didactic purposes.</p>
+  <h4 id="p2p-discovery">P2P discovery</h4>
+  <p>For a gossip protocol to work a node needs to locate other nodes. Conceptually easy to understand, but pretty hard to get it right.</p>
+  <p>For my first try I went for the easy solution. There was a “master” node and all the workers registered into it (the ip of the master node was a parameter). Of course, this is extremely simple and convenient to implement, but it’s a pretty bad system design, it’s basically a SPOF.</p>
+  <p>I wanted the system to be resilient and as close to a production system as possible with the limited time I had, so I had a look at the P2P discovery state of the art. <a href="https://jsantell.com/p2p-peer-discovery">This post by Nordan Jantell</a> gives a nice summary btw.</p>
+  <p>There are some interesting options. Some of them are really cool, but I needed something for this specific project. Something that would run in the same network and inside docker containers. So, no global DHTs.</p>
+  <p>This left me basically with 3 options:</p>
+  <ul>
+    <li><strong>Broadcast packets</strong>: This one is cool. When a node starts up it sends a <code>hello world</code> signal to the network broadcast address, so everybody receives that. What I don’t like about this solution is the amount of network messages it sends in the beginning. Right, it’s just when a node bootstraps, but I wanted to see if I could come up with something slightly different.</li>
+    <li><strong>Central node</strong> that knows all the nodes.</li>
+    <li><strong>External system</strong>. Something like <code>zookeeper</code>. At the end of the day this has the same implications as having a central node.</li>
+  </ul>
+  <p>I played a little bit and I went for something custom, I haven’t tested it fully and I would not put this into production without some real tests first. Consider it just a playground.</p>
+  <p>My solution is a mixture of different things. Instead of having one single master node I had the idea of having a “group of master nodes”. So, when a node starts up it doesn’t try to contact one specific node, but one specific node of a group. This way you balance the load between them. When these master nodes bootstrap they also use the same nodes, in this way we make sure that there are no partitions in the groups of peers.</p>
+  <p>This works for this case. I haven’t studied it deeply to understand the different implications it might have in a real system. Just a fun toy.</p>
+  <p>So, to sum up: A guy just told me that there is a nice gossip protocol playground around. Feel free to have a look at the <a href="https://github.com/lant/gossip">repo in github!</a></p>
+
+  <hr>
+  <a id="blog_hystrix"><h2>Hystrix</h2></a>
+  <b>Publication date: </b> 05/12/2013<br>
+  <b>Originally pubished in Blogspot</a></b><br>
+
+  <p>You know Hystrix? if you are building distributed systems (in the JVM) you should probably use it. If you want to sleep at night that is.<p>
+
+  <p>First a gentle introduction. Hystrix a is a library open-sourced by Netflix that helps you deal (and live) with failures in distributed systems. You can find some docs [<a href="https://github.com/Netflix/Hystrix/wiki">here</a>], the blog post announcing it [<a href="http://techblog.netflix.com/2012/11/hystrix.html">here</a>] and the code in [<a href="https://github.com/Netflix/Hystrix">github</a>], oh, and they even have a [<a href="https://twitter.com/HystrixOSS">twitter account</a>].</p>
+
+  <p>So Hystrix lets your system fail in a controlled way instead of going down in a free fall. It does this by letting the user create fallbacks and using the <a href="https://en.wikipedia.org/wiki/Circuit_breaker_design_pattern">circuit breaker pattern</a>.</p>
+
+  <p>Lets do a small pause here, if you don't know what the <em>circuit breaker pattern</em> is you should go and grab this:</p>
+
+  <a href="https://pragprog.com/titles/mnee2/release-it-second-edition/"><img
+      src="https://pragprog.com/titles/mnee2/release-it-second-edition/mnee2_hu6d5b8b63a4954cb696e89b39f929331b_522342_500x0_resize_q75_box.jpg"
+      width="266" height="320" alt="release it book cover"/></a>
+
+  <br>
+  <a href="http://pragprog.com/book/mnee/release-it">Release It!</a> 
+  <br>
+  (<em><span style="font-size: x-small;">I have no commission unfortunately</span></em>)
+
+  <p>I got this book by chance and it was a real life saver. It basically describes real world errors and how they escalated from a database lock to a full disaster and how they can be detected and prevented. More or less. Basically it taught me that failure needs to be a first citizen when you design a system. Failure will happen. Period.</p> 
+
+  <p>
+    Getting back to Hystrix... 
+  </p>
+
+  <p>Hystrix is basically and implementation of the patterns described in the book, and in fact, I really think that the github page should have a message telling the user to read the book, and once that's done get back to Hystrix. Everything makes (much more) sense afterwards.</p>
+
+  <p>
+    I've been playing a little bit with it, with toy method basically and well, it works really nicely (as expected, coming from Netflix). It might seem to be a little cumbersome, you really need to write lots of code, but I don't know of any better alternative, or worse in fact. Other than filling your code with <em>try ... catch ... finally</em>  and your own fallback methods. 
+  </p>
+
+  <p>Overall, the library will let you have fallbacks/circuitbreakers in places where failures are expected to happen, like connections to db's, connection to 3rd party API's, network stuff and threads. All you have to do is wrap these potentially disastrous invocations in <em>HystrixCommand</em> classes and define their workflow, the rest is done by the library. </p>
+
+  <p>The patters implemented in Hystrix and described in the book are applicable anywhere, specially if you are working on a <strong>Service Oriented Architecture</strong> (remember kids, nothing to do with that crappy SOAP technology) or API's. </p>
+
+  <p>
+    All in all a really nice framework, could be simpler, or less verbose. 
+  </p>
+
+  <p>
+    <strong>Summary:</strong> If you are implementing backend systems that need to run no matter what on the JVM use Hystrix. 
+  </p>
+
+
+</main>
+
+<!-- FOOOTER -->
+<footer>
+  You can find me at marcdepalol at posteo net
+</footer>
+</body>
+</html>
+
